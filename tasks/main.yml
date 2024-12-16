@@ -157,7 +157,7 @@
 
         - name: "Updating foreman-proxy GECOS"
           # After running the puppet installer, it rewrites everything it found different in the environment, 
-          # and to keep our users under AccessHub control, we need to rewrite the GECOS field, which was overwritten by the puppet installer
+          # and to keep our users under control, we need to rewrite the GECOS field, which was overwritten by the puppet installer
           ansible.builtin.user:
             name: foreman-proxy
             comment: "000/S/123456//OurPersonalID/example@mail.com"
