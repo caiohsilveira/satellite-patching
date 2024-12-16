@@ -1,0 +1,324 @@
+---
+- name: "Determine System"
+  # This executes a command that will return the word “Capsule” or “Satellite” according to the server,
+  # this word is stored in the “sys_type” variable.
+  ansible.builtin.shell: "set -o pipefail && foreman-installer --list-scenarios | grep INSTALLED | awk '{print $(NF-1)}'"
+  register: sys_type
+  changed_when: sys_type.rc == 0
+  failed_when: sys_type.rc != 0
+
+- name: "Starting tasks"
+  # Here the Block starts when there is a word “Capsule” or “Satellite” in the “sys_type” variable
+  # Otherwise, nothing happens.
+  when: sys_type.stdout == "Satellite" or sys_type.stdout == "Capsule"
+  block:
+    - name: "Showing message"
+      # Prints a message on the screen
+      ansible.builtin.debug:
+        msg:
+          - "---------------------------------"
+          - " Starting {{ sys_type.stdout }} update tasks "
+          - "---------------------------------"
+      run_once: true
+
+    - name: "Checking for running tasks"
+      # Only for Satellite, which has the execution of tasks (syncing repos, publishing content, etc.)
+      # If this is happening during the update check or run command, the Puppet wizard will ask if 
+      # we would like to wait for the tasks to finish, so as not to have to deal with this, 
+      # we fail the playbook with the next task, and after the Satellite administrator confirms that 
+      # there are no more tasks running, he/she can re-execute the playbook again.
+      when: sys_type.stdout == "Satellite"
+      ansible.builtin.shell: "set -o pipefail && hammer --csv --no-headers task list --search state=running | wc -l"
+      register: running_tasks
+      changed_when: running_tasks.rc == 0
+      failed_when: running_tasks.rc != 0
+
+    - name: "Failing because there are tasks running"
+      # Failing as explained in the previous comment
+      when: sys_type.stdout == "Satellite" and running_tasks is defined and running_tasks.stdout | int > 1
+      ansible.builtin.fail:
+        msg:
+          - "***********************************************************************"
+          - " There are {{ running_tasks.stdout | int }} running tasks, please check them before continuing..."
+          - "***********************************************************************"
+
+    - name: "[BLOCK] Running update check"
+      # After making sure that there are no tasks running (only for “Satellite”), let's start running the update verification Block.
+      block:
+        - name: "Running update check"
+          # Check command with -y to answer 'yes' to the: “Do you want to remove old tasks?” in the Puppet wizard
+          # --plaintext to format the output
+          # --whitelist added through the AAP survey what should be ignored, such as the warning for the presence of
+          # non-redhat rpms (Falcon-sensor, etc...).
+          ansible.builtin.command:
+            argv:
+              - satellite-maintain
+              - upgrade
+              - check
+              - -y
+              - --plaintext
+              - --target-version
+              - "{{ ui_satellite_version }}"
+              - '{% if ui_whitelist is defined %}--whitelist={{ ui_whitelist }}{% endif %}'
+          register: update_check
+          changed_when: update_check.rc == 0
+          failed_when: update_check.rc != 0
+
+      rescue:
+      # Dealing with update check command errors
+        - name: "Move data.yml from /var/lib/foreman-maintain directory to /tmp"
+          # overcoming error: https://access.redhat.com/solutions/7024880
+          when: "'pulpcore_migration_services' in update_check.stderr"
+          # Content suggestion provided by Ansible Lightspeed
+          ansible.builtin.command: mv /var/lib/foreman-maintain/data.yml /tmp/data.yml
+          changed_when: true
+
+        - name: "Rebuild rpmdb"
+          # fixing the RPM database
+          failed_when: false
+          changed_when: update_check.rc != 0
+          when: "'Thread died in Berkeley DB library' in update_check.stdout"
+          ansible.builtin.shell: |
+            mkdir /var/lib/rpm/backup
+            cp -a /var/lib/rpm/__db* /var/lib/rpm/backup/
+            rm -f /var/lib/rpm/__db.[0-9][0-9]*
+            rpm --quiet -qa
+            rpm --rebuilddb
+            yum clean all
+
+        - name: "Running update check"
+          # Rerunning the update check after overcoming errors
+          ansible.builtin.command:
+            argv:
+              - satellite-maintain
+              - upgrade
+              - check
+              - -y
+              - --plaintext
+              - --target-version
+              - "{{ ui_satellite_version }}"
+              - '{% if ui_whitelist is defined %}--whitelist={{ ui_whitelist }}{% endif %}'
+          register: update_check
+          changed_when: update_check.rc == 0
+          failed_when: update_check.rc != 0
+
+    - name: "Result of the Check"
+      # shows the output of the check
+      ansible.builtin.debug:
+        var: update_check.stdout_lines
+
+    - name: "Running update procedures"
+      # Considering that the check was completed successfully, as the return code is equal to zero (update_check.rc == 0) 
+      # we start the update block
+      when: update_check.rc == 0
+      block:
+        - name: "Showing message"
+          ansible.builtin.debug:
+            msg:
+              - "---------------------------------------------"
+              - " All checks have been completed successfully "
+              - " Starting execution of the update command    "
+              - "---------------------------------------------"
+          run_once: true
+
+        - name: "Sending a message in the slack channel"
+          # Sends a message to notify the team/users that the Satellite will start updating and will become unavailable
+          when: slack_token is defined and sys_type.stdout == "Satellite"
+          community.general.slack:
+            token: "{{ slack_token }}"
+            msg: "<REMOVED> My custom message"
+
+        - name: "Running update command"
+          # The update command is exactly the same as the check command, we just change 'check' to 'run'
+          ansible.builtin.command:
+            argv:
+              - satellite-maintain
+              - upgrade
+              - run
+              - -y
+              - --plaintext
+              - --target-version
+              - "{{ ui_satellite_version }}"
+              - '{% if ui_whitelist is defined %}--whitelist={{ ui_whitelist }}{% endif %}'
+          register: update_command
+          changed_when: update_command.rc == 0
+          failed_when: update_command.rc != 0
+
+        - name: "Showing output"
+          # shows the output of the run
+          ansible.builtin.debug:
+            var: update_command.stdout_lines
+
+        # ---------------------------------------------------
+        # The tasks below are performed after each patching, 
+        # as the Puppet Installer reconfigures the 
+        # entire Satellite and undoes any changes found.    
+        # ---------------------------------------------------
+
+        - name: "Updating foreman-proxy GECOS"
+          # After running the puppet installer, it rewrites everything it found different in the environment, 
+          # and to keep our users under AccessHub control, we need to rewrite the GECOS field, which was overwritten by the puppet installer
+          ansible.builtin.user:
+            name: foreman-proxy
+            comment: "000/S/123456//OurPersonalID/example@mail.com"
+
+        - name: "Updating foreman GECOS"
+          # In addition to the 'foreman-proxy' user (set above in Capsules and Satellite) Satellite has the 'foreman' user
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.user:
+            name: foreman
+            comment: "000/S/123456//OurPersonalID/example@mail.com"
+
+        - name: "Finding katello files"
+          # The katello-ca-consumer files are deprecated in Satellite version 6.15, 
+          # but for previous versions when a new file is generated, we search for them and ensure that 
+          # they have the appropriate permissions, since we have permissions set at the unmask level
+          when: sys_type.stdout == "Capsule"
+          ansible.builtin.find:
+            paths: "/var/www/html/pub/"
+            patterns: "katello-ca-consumer-{{ ansible_hostname[:1] }}*"
+          register: katello_files
+
+        - name: "Setting katello files"
+          # Setting permissions
+          when: sys_type.stdout == "Capsule"
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            mode: '0644'
+          loop: "{{ katello_files.files }}"
+        
+        - name: "Add rewrite rule to Satellite URL"
+          # After deploying the keycloak, the previous login page should be disabled, preventing users from using the wrong URL. 
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.blockinfile:
+            path: "/etc/httpd/conf.d/05-foreman-ssl.conf"
+            block: |
+              {% filter indent(width=2, first=true) %}
+              ## Rewrite rule to disable default login page
+              RewriteEngine On
+              RewriteRule ^/users/login$ / [R=301,L]
+              {% endfilter %}
+            insertafter: '  ServerName {{ ansible_fqdn }}'
+            state: present
+       
+        - name: "Find OIDC conf foreman-openidc_oidc_keycloak_satellite"
+          # The OIDC file for the keycloak needs to be duplicated to target the custom DNS
+          # We've got his name here (this may be different for Prod/Dev servers).
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.find:
+            paths: '/etc/httpd/conf.d/'
+            patterns: 'foreman-openidc_oidc_keycloak_satellite_*.conf'
+            recurse: false
+          register: foreman_filesfound
+
+        - name: "Set new file name"
+          # Set a new name
+          when: sys_type.stdout == "Satellite" and not item.path.endswith('2.conf')
+          ansible.builtin.set_fact:
+            foreman_src_file: "{{ item.path }}"
+            foreman_dest_file: "{{ item.path | regex_replace('(.+)\\.conf$', '\\1_2.conf') }}"
+          loop: "{{ foreman_filesfound.files }}"
+
+        - name: "Copy OIDC conf foreman-openidc_oidc_keycloak_satellite"
+          # Duplicate the file with the new name
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.copy:
+            src: "{{ foreman_src_file }}"
+            dest: "{{ foreman_dest_file }}"
+            remote_src: true
+            mode: preserve
+
+        - name: "Modify Satellite URL in OIDC conf"
+          # And finally replace the hostname for the custom DNS
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.replace:
+            path: "{{ foreman_dest_file }}"
+            regexp: 'https://{{ ansible_fqdn }}/'
+            replace: '{{ satellite_server_url }}'
+        
+        - name: "Restart httpd"
+          # restart apache to apply the changes
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.service:
+            name: httpd
+            state: restarted
+
+        - name: " Checking if needs to be restarted"
+          # Now we need to check if the server (Satellite or Capsule) needs to be rebooted, 
+          # if it has installed kernel rpms for example
+          ansible.builtin.command: "dnf needs-restarting --reboothint"
+          register: needs_restarting
+          changed_when: needs_restarting.rc == 1
+          failed_when: needs_restarting.rc > 1
+
+        - name: "Stopping services to reboot"
+          # We stop the services (for database protection)
+          ansible.builtin.command: "satellite-maintain service stop"
+          register: service_stop
+          changed_when: service_stop.rc == 0
+          failed_when: service_stop.rc != 0
+          when: needs_restarting.rc == 1
+
+        - name: "Rebooting server"
+          # We have opened a Block because the reboot task may fail when reconnecting Ansible with the Server
+          when: needs_restarting.rc == 1
+          block:
+            - name: "Rebooting server"
+              register: reboot_output
+              ansible.builtin.reboot:
+                msg: "Starting reboot"
+                post_reboot_delay: 120
+                reboot_timeout: 600
+                test_command: uptime
+          rescue:
+            - name: "Try to reconnect"
+              # if the above fails, a new attempt is made
+              ansible.builtin.wait_for_connection:
+                delay: 10
+                timeout: 600
+
+        - name: "Paused for 1 minute"
+          # After the reboot, it is wise to wait a while before checking that all services are running
+          ansible.builtin.pause:
+            minutes: 1
+
+        - name: "Checking Satellite Services"
+          # For Satellite we use the hammer command
+          when: sys_type.stdout == "Satellite"
+          ansible.builtin.command: "hammer ping"
+          register: hammer_ping
+          changed_when: hammer_ping.rc == 0
+          failed_when: hammer_ping.rc != 0
+
+        - name: "Sending a message in the slack channel"
+          # We've notified Slack that the update is finished, 
+          # after all Satellite is available and our capsules have a balancer, 
+          # so from now on there will be no more downtime.
+          when: slack_token is defined and sys_type.stdout == "Satellite"
+          community.general.slack:
+            token: "{{ slack_token }}"
+            msg: "<REMOVED> My custom message"
+
+        - name: "Checking Capsule Services"
+          # For the capsules we checked with another command, as they don't have the hammer
+          when: sys_type.stdout == "Capsule"
+          ansible.builtin.command: "satellite-maintain service status -b"
+          register: capsule_services
+          changed_when: capsule_services.rc == 0
+          failed_when: capsule_services.rc != 0
+
+      rescue:
+      # If any task within the update block fails, an alert will be sent to slack and the playbook will fail.
+        - name: "Sending a message in the slack channel"
+          when: slack_token is defined and sys_type.stdout == "Satellite"
+          community.general.slack:
+            token: "{{ slack_token }}"
+            msg: "<REMOVED> My custom message"
+
+        - name: "Failing because rescue was triggered"
+          ansible.builtin.fail:
+            msg:
+              - "***********************************************************************"
+              - " Update failure, please check the logs."
+              - "***********************************************************************"
+...
